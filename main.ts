@@ -15,7 +15,7 @@ import {
 import { HttpRequest, HttpResponse } from "@aws-sdk/protocol-http";
 import { HttpHandlerOptions } from "@aws-sdk/types";
 import { buildQueryString } from "@aws-sdk/querystring-builder";
-import { requestTimeout } from "@aws-sdk/fetch-http-handler/dist-es/request-timeout";
+import { requestTimeout } from "@smithy/fetch-http-handler/dist-es/request-timeout";
 
 import {
 	FetchHttpHandler,
@@ -235,7 +235,7 @@ export default class S3UploaderPlugin extends Plugin {
 			this.s3 = new S3Client({
 				region: this.settings.region,
 				credentials: {
-					clientConfig: { region: this.settings.region },
+					// clientConfig: { region: this.settings.region },
 					accessKeyId: this.settings.accessKey,
 					secretAccessKey: this.settings.secretKey,
 				},
@@ -247,7 +247,7 @@ export default class S3UploaderPlugin extends Plugin {
 			this.s3 = new S3Client({
 				region: this.settings.region,
 				credentials: {
-					clientConfig: { region: this.settings.region },
+					// clientConfig: { region: this.settings.region },
 					accessKeyId: this.settings.accessKey,
 					secretAccessKey: this.settings.secretKey,
 				},
@@ -597,7 +597,7 @@ const wrapFileDependingOnType = (
 			throw new Error("PDFs cannot be embedded in local mode");
 		}
 		return `<iframe frameborder=0 border=0 width=100% height=800
-	src="https://docs.google.com/viewer?url=${location}?raw=true">
+	src="https://docs.google.com/viewer?embedded=true&url=${location}?raw=true">
 </iframe>`;
 	} else {
 		throw new Error("Unknown file type");
