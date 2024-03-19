@@ -11,21 +11,19 @@ import {
 	FileSystemAdapter,
 	RequestUrlParam,
 	requestUrl,
+	DataAdapter,
+	FrontMatterCache,
 } from "obsidian";
 import { HttpRequest, HttpResponse } from "@aws-sdk/protocol-http";
 import { HttpHandlerOptions } from "@aws-sdk/types";
 import { buildQueryString } from "@aws-sdk/querystring-builder";
 import { requestTimeout } from "@smithy/fetch-http-handler/dist-es/request-timeout";
-
 import {
 	FetchHttpHandler,
 	FetchHttpHandlerOptions,
 } from "@smithy/fetch-http-handler";
-
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import * as crypto from "crypto";
-
-// Remember to rename these classes and interfaces!
 
 interface pasteFunction {
 	(this: HTMLElement, event: ClipboardEvent | DragEvent): void;
@@ -100,6 +98,75 @@ export default class S3UploaderPlugin extends Plugin {
 		}
 	}
 
+	getFileType(
+		file: File,
+		uploadVideo: any,
+		uploadAudio: any,
+		uploadPdf: any
+	) {
+		const type = file.type;
+		if (type.startsWith("video/") && uploadVideo) return "video";
+		if (type.startsWith("audio/") && uploadAudio) return "audio";
+		if (type === "application/pdf" && uploadPdf) return "pdf";
+		if (type.startsWith("image/")) return "image";
+		return null; // Unsupported file type
+	}
+
+	getFolderPath(
+		fm: FrontMatterCache | undefined,
+		localUpload: boolean,
+		currentDate: Date
+	): string {
+		let baseFolder = localUpload
+			? this.settings.localUploadFolder
+			: this.settings.folder;
+		baseFolder = baseFolder.trim();
+		if (fm) {
+			baseFolder =
+				(localUpload ? fm.localUploadFolder : fm.folder) || baseFolder;
+		}
+		return baseFolder
+			.replace("${year}", currentDate.getFullYear().toString())
+			.replace(
+				"${month}",
+				String(currentDate.getMonth() + 1).padStart(2, "0")
+			)
+			.replace("${day}", String(currentDate.getDate()).padStart(2, "0"));
+	}
+
+	async uploadFile(
+		localUpload: boolean,
+		file: File,
+		key: string,
+		buf: ArrayBuffer
+	): Promise<string> {
+		const buffer = new Uint8Array(buf); // Convert to Uint8Array if not already
+
+		if (!localUpload) {
+			await this.s3.send(
+				new PutObjectCommand({
+					Bucket: this.settings.bucket,
+					Key: key,
+					Body: buffer,
+					ContentType: file.type,
+				})
+			);
+			return `${this.settings.imageUrlPath}${key}`;
+		} else {
+			// Ensure the local folder exists (create if it doesn't)
+			const folderPath = key.substring(0, key.lastIndexOf("/"));
+			if (
+				!(await this.app.vault.adapter.exists(folderPath)) &&
+				folderPath
+			) {
+				await this.app.vault.createFolder(folderPath);
+			}
+			await this.app.vault.adapter.writeBinary(key, buffer);
+			// In Obsidian, local files should be linked relative to the vault root, without leading '/'
+			return key.startsWith("/") ? key.slice(1) : key;
+		}
+	}
+
 	async pasteHandler(
 		ev: ClipboardEvent | DragEvent,
 		editor: Editor
@@ -111,43 +178,52 @@ export default class S3UploaderPlugin extends Plugin {
 		const noteFile = this.app.workspace.getActiveFile();
 		if (!noteFile || !noteFile.name) return;
 
+		// Handle frontmatter settings
 		const fm = this.app.metadataCache.getFileCache(noteFile)?.frontmatter;
-		const localUpload = fm?.localUpload ?? this.settings.localUpload;
-		const uploadVideo = fm?.uploadVideo ?? this.settings.uploadVideo;
-		const uploadAudio = fm?.uploadAudio ?? this.settings.uploadAudio;
-		const uploadPdf = fm?.uploadPdf ?? this.settings.uploadPdf;
+		const localUpload =
+			typeof fm?.localUpload !== "undefined"
+				? fm.localUpload
+				: this.settings.localUpload;
+		const uploadVideo =
+			typeof fm?.uploadVideo !== "undefined"
+				? fm.uploadVideo
+				: this.settings.uploadVideo;
+		const uploadAudio =
+			typeof fm?.uploadAudio !== "undefined"
+				? fm.uploadAudio
+				: this.settings.uploadAudio;
+		const uploadPdf =
+			typeof fm?.uploadPdf !== "undefined"
+				? fm.uploadPdf
+				: this.settings.uploadPdf;
+		const uploadOnDrag =
+			typeof fm?.uploadOnDrag !== "undefined"
+				? fm.uploadOnDrag
+				: this.settings.uploadOnDrag;
+
+		if (ev.type === "drop" && !uploadOnDrag) {
+			return;
+		}
 
 		let files: File[] = [];
-		switch (ev.type) {
-			case "paste":
-				files = Array.from(
-					(ev as ClipboardEvent).clipboardData?.files || []
-				);
-				break;
-			case "drop":
-				if (!this.settings.uploadOnDrag && !(fm && fm.uploadOnDrag)) {
-					return;
-				}
-				files = Array.from((ev as DragEvent).dataTransfer?.files || []);
-				break;
+		if (ev.type === "paste") {
+			files = Array.from(
+				(ev as ClipboardEvent).clipboardData?.files || []
+			);
+		} else if (ev.type === "drop") {
+			files = Array.from((ev as DragEvent).dataTransfer?.files || []);
 		}
 
 		if (files.length > 0) {
 			ev.preventDefault();
-
 			const uploads = files.map(async (file) => {
-				let thisType = "";
-				if (file.type.match(/video.*/) && uploadVideo) {
-					thisType = "video";
-				} else if (file.type.match(/audio.*/) && uploadAudio) {
-					thisType = "audio";
-				} else if (file.type.match(/application\/pdf/) && uploadPdf) {
-					thisType = "pdf";
-				} else if (file.type.match(/image.*/)) {
-					thisType = "image";
-				}
-
-				if (!thisType) return;
+				const thisType = this.getFileType(
+					file,
+					uploadVideo,
+					uploadAudio,
+					uploadPdf
+				);
+				if (!thisType) return; // Skip unsupported file types
 
 				const buf = await file.arrayBuffer();
 				const digest = crypto
@@ -158,46 +234,20 @@ export default class S3UploaderPlugin extends Plugin {
 				const placeholder = `![uploading...](${newFileName})\n`;
 				editor.replaceSelection(placeholder);
 
-				let folder = fm?.folder ?? this.settings.folder;
-				const currentDate = new Date();
-				folder = folder
-					.replace("${year}", currentDate.getFullYear().toString())
-					.replace(
-						"${month}",
-						String(currentDate.getMonth() + 1).padStart(2, "0")
-					)
-					.replace(
-						"${day}",
-						String(currentDate.getDate()).padStart(2, "0")
-					);
+				let folder = this.getFolderPath(fm, localUpload, new Date());
 				const key = folder ? `${folder}/${newFileName}` : newFileName;
 
 				try {
-					let url;
-					if (!localUpload) {
-						await this.s3.send(
-							new PutObjectCommand({
-								Bucket: this.settings.bucket,
-								Key: key,
-								Body: new Uint8Array(buf),
-								ContentType: file.type,
-							})
-						);
-						url = this.settings.imageUrlPath + key;
-					} else {
-						await this.app.vault.adapter.writeBinary(
-							key,
-							new Uint8Array(buf)
-						);
-						url =
-							this.app.vault.adapter instanceof FileSystemAdapter
-								? this.app.vault.adapter.getFullPath(key)
-								: key;
-					}
+					let url = await this.uploadFile(
+						localUpload,
+						file,
+						key,
+						buf
+					);
 					const imgMarkdownText = wrapFileDependingOnType(
 						url,
 						thisType,
-						""
+						localUpload ? this.settings.localUploadFolder : ""
 					);
 					this.replaceText(editor, placeholder, imgMarkdownText);
 				} catch (error) {
@@ -219,9 +269,10 @@ export default class S3UploaderPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
+		// Add the settings tab
 		this.addSettingTab(new S3UploaderSettingTab(this.app, this));
 
+		// Configure the S3 client
 		let apiEndpoint = this.settings.useCustomEndpoint
 			? this.settings.customEndpoint
 			: `https://s3.${this.settings.region}.amazonaws.com/`;
@@ -231,34 +282,19 @@ export default class S3UploaderPlugin extends Plugin {
 			? apiEndpoint + this.settings.bucket + "/"
 			: apiEndpoint.replace("://", `://${this.settings.bucket}.`);
 
-		if (this.settings.bypassCors) {
-			this.s3 = new S3Client({
-				region: this.settings.region,
-				credentials: {
-					// clientConfig: { region: this.settings.region },
-					accessKeyId: this.settings.accessKey,
-					secretAccessKey: this.settings.secretKey,
-				},
-				endpoint: apiEndpoint,
-				forcePathStyle: this.settings.forcePathStyle,
-				requestHandler: new ObsHttpHandler({ keepAlive: false }),
-			});
-		} else {
-			this.s3 = new S3Client({
-				region: this.settings.region,
-				credentials: {
-					// clientConfig: { region: this.settings.region },
-					accessKeyId: this.settings.accessKey,
-					secretAccessKey: this.settings.secretKey,
-				},
-				endpoint: apiEndpoint,
-				forcePathStyle: this.settings.forcePathStyle,
-				requestHandler: new ObsHttpHandler({ keepAlive: false }),
-			});
-		}
+		this.s3 = new S3Client({
+			region: this.settings.region,
+			credentials: {
+				accessKeyId: this.settings.accessKey,
+				secretAccessKey: this.settings.secretKey,
+			},
+			endpoint: apiEndpoint,
+			forcePathStyle: this.settings.forcePathStyle,
+			requestHandler: new ObsHttpHandler({ keepAlive: false }),
+		});
 
+		// Bind the paste and drop functions
 		this.pasteFunction = this.pasteHandler.bind(this);
-
 		this.registerEvent(
 			this.app.workspace.on("editor-paste", this.pasteFunction)
 		);
@@ -437,7 +473,7 @@ class S3UploaderSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Copy to local folder")
 			.setDesc(
-				"Copy images to local folder instead of s3. To override this setting on a per-document basis, you can add `uploadLocal: true` to YAML frontmatter of the note.  This will copy the images to a folder in your local file system, instead of s3."
+				"Copy images to a local folder (valut root) instead of s3. To override this setting on a per-document basis, you can add `localUpload: true` to YAML frontmatter of the note.  This will copy the images to a folder in your local file system, instead of s3."
 			)
 			.addToggle((toggle) => {
 				toggle
@@ -451,7 +487,7 @@ class S3UploaderSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Local folder")
 			.setDesc(
-				'Local folder to save images, instead of s3. To override this setting on a per-document basis, you can add `uploadFolder: "myFolder"` to YAML frontmatter of the note.  This affects only local uploads.'
+				'The local folder in your vault to save images, instead of s3. To override this setting on a per-document basis, you can add `localUploadFolder: "myFolder"` to YAML frontmatter of the note.  This affects only local uploads.'
 			)
 			.addText((text) =>
 				text
@@ -553,7 +589,7 @@ class S3UploaderSettingTab extends PluginSettingTab {
 			});
 	}
 }
-
+// Utility functions
 const wrapTextWithPasswordHide = (text: TextComponent) => {
 	const hider = text.inputEl.insertAdjacentElement(
 		"beforebegin",
@@ -563,16 +599,10 @@ const wrapTextWithPasswordHide = (text: TextComponent) => {
 		return;
 	}
 	setIcon(hider as HTMLElement, "eye-off");
-
 	hider.addEventListener("click", () => {
 		const isText = text.inputEl.getAttribute("type") === "text";
-		if (isText) {
-			setIcon(hider as HTMLElement, "eye-off");
-			text.inputEl.setAttribute("type", "password");
-		} else {
-			setIcon(hider as HTMLElement, "eye");
-			text.inputEl.setAttribute("type", "text");
-		}
+		text.inputEl.setAttribute("type", isText ? "password" : "text");
+		setIcon(hider as HTMLElement, isText ? "eye" : "eye-off");
 		text.inputEl.focus();
 	});
 	text.inputEl.setAttribute("type", "password");
@@ -584,134 +614,103 @@ const wrapFileDependingOnType = (
 	type: string,
 	localBase: string
 ) => {
-	const srcPrefix = localBase ? "file://" + localBase + "/" : "";
-
-	if (type === "image") {
-		return `![image](${location})`;
-	} else if (type === "video") {
-		return `<video src="${srcPrefix}${location}" controls />`;
-	} else if (type === "audio") {
-		return `<audio src="${srcPrefix}${location}" controls />`;
-	} else if (type === "pdf") {
-		if (localBase) {
-			throw new Error("PDFs cannot be embedded in local mode");
-		}
-		return `<iframe frameborder=0 border=0 width=100% height=800
-	src="https://docs.google.com/viewer?embedded=true&url=${location}?raw=true">
-</iframe>`;
-	} else {
-		throw new Error("Unknown file type");
+	const srcPrefix = localBase ? `file://${localBase}/` : "";
+	switch (type) {
+		case "image":
+			return `![image](${location})`;
+		case "video":
+			return `<video src="${srcPrefix}${location}" controls />`;
+		case "audio":
+			return `<audio src="${srcPrefix}${location}" controls />`;
+		case "pdf":
+			return `<iframe frameborder="0" border="0" width="100%" height="800" src="${location}"></iframe>`;
+		default:
+			throw new Error("Unknown file type");
 	}
 };
 
-////////////////////////////////////////////////////////////////////////////////
-// special handler using Obsidian requestUrl
-////////////////////////////////////////////////////////////////////////////////
-
-/**
- * This is close to origin implementation of FetchHttpHandler
- * https://github.com/aws/aws-sdk-js-v3/blob/main/packages/fetch-http-handler/src/fetch-http-handler.ts
- * that is released under Apache 2 License.
- * But this uses Obsidian requestUrl instead.
- */
+// Handler for Obsidian's requestUrl method
 class ObsHttpHandler extends FetchHttpHandler {
 	requestTimeoutInMs: number | undefined;
+
 	constructor(options?: FetchHttpHandlerOptions) {
 		super(options);
-		this.requestTimeoutInMs =
-			options === undefined ? undefined : options.requestTimeout;
+		this.requestTimeoutInMs = options?.requestTimeout;
 	}
+
 	async handle(
 		request: HttpRequest,
-		{ abortSignal }: HttpHandlerOptions = {}
+		options: HttpHandlerOptions = {}
 	): Promise<{ response: HttpResponse }> {
-		if (abortSignal?.aborted) {
-			const abortError = new Error("Request aborted");
-			abortError.name = "AbortError";
-			return Promise.reject(abortError);
+		if (options.abortSignal?.aborted) {
+			throw new Error("Request aborted");
 		}
 
 		let path = request.path;
 		if (request.query) {
-			const queryString = buildQueryString(request.query);
-			if (queryString) {
-				path += `?${queryString}`;
-			}
+			path += `?${buildQueryString(request.query)}`;
 		}
 
-		const { port, method } = request;
 		const url = `${request.protocol}//${request.hostname}${
-			port ? `:${port}` : ""
+			request.port ? `:${request.port}` : ""
 		}${path}`;
+		const headers = Object.fromEntries(
+			Object.entries(request.headers).filter(
+				([key]) =>
+					!["host", "content-length"].includes(key.toLowerCase())
+			)
+		);
+
 		const body =
-			method === "GET" || method === "HEAD" ? undefined : request.body;
+			request.method === "GET" || request.method === "HEAD"
+				? undefined
+				: request.body;
+		const contentType = headers["content-type"];
 
-		const transformedHeaders: Record<string, string> = {};
-		for (const key of Object.keys(request.headers)) {
-			const keyLower = key.toLowerCase();
-			if (keyLower === "host" || keyLower === "content-length") {
-				continue;
-			}
-			transformedHeaders[keyLower] = request.headers[key];
-		}
+		const transformedBody = ArrayBuffer.isView(body)
+			? bufferToArrayBuffer(body)
+			: body;
 
-		let contentType: string | undefined = undefined;
-		if (transformedHeaders["content-type"] !== undefined) {
-			contentType = transformedHeaders["content-type"];
-		}
-
-		let transformedBody: any = body;
-		if (ArrayBuffer.isView(body)) {
-			transformedBody = bufferToArrayBuffer(body);
-		}
-
-		const param: RequestUrlParam = {
+		const responsePromise = requestUrl({
+			url,
+			method: request.method,
 			body: transformedBody,
-			headers: transformedHeaders,
-			method: method,
-			url: url,
-			contentType: contentType,
-		};
+			headers,
+			contentType,
+		});
 
-		const raceOfPromises = [
-			requestUrl(param).then((rsp) => {
-				const headers = rsp.headers;
-				const headersLower: Record<string, string> = {};
-				for (const key of Object.keys(headers)) {
-					headersLower[key.toLowerCase()] = headers[key];
-				}
-				const stream = new ReadableStream<Uint8Array>({
-					start(controller) {
-						controller.enqueue(new Uint8Array(rsp.arrayBuffer));
-						controller.close();
-					},
-				});
-				return {
-					response: new HttpResponse({
-						headers: headersLower,
-						statusCode: rsp.status,
-						body: stream,
-					}),
-				};
-			}),
+		return Promise.race([
+			responsePromise.then((rsp) => ({
+				response: new HttpResponse({
+					statusCode: rsp.status,
+					headers: Object.fromEntries(
+						Object.entries(rsp.headers).map(([k, v]) => [
+							k.toLowerCase(),
+							v,
+						])
+					),
+					body: rsp.arrayBuffer
+						? new ReadableStream<Uint8Array>({
+								start(controller) {
+									controller.enqueue(
+										new Uint8Array(rsp.arrayBuffer)
+									);
+									controller.close();
+								},
+						  })
+						: undefined,
+				}),
+			})),
 			requestTimeout(this.requestTimeoutInMs),
-		];
-
-		if (abortSignal) {
-			raceOfPromises.push(
-				new Promise<never>((resolve, reject) => {
-					abortSignal.onabort = () => {
-						const abortError = new Error("Request aborted");
-						abortError.name = "AbortError";
-						reject(abortError);
-					};
-				})
-			);
-		}
-		return Promise.race(raceOfPromises);
+		]);
 	}
 }
 
-const bufferToArrayBuffer = (b: Buffer | Uint8Array | ArrayBufferView) => {
-	return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+const bufferToArrayBuffer = (
+	buffer: Buffer | Uint8Array | ArrayBufferView
+): ArrayBuffer => {
+	return buffer.buffer.slice(
+		buffer.byteOffset,
+		buffer.byteOffset + buffer.byteLength
+	);
 };
